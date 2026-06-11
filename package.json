@@ -1,0 +1,25 @@
+{
+  "name": "redkit-orchestrator",
+  "version": "1.0.0",
+  "description": "Per-user browser-container orchestrator for RedKit. Creates/stops a dedicated Kali (noVNC + proxy) container per Supabase user on demand.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "docker",
+    "orchestrator",
+    "redkit",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dockerode": "^4.0.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "http-proxy": "^1.18.1"
+  }
+}
