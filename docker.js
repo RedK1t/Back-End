@@ -44,6 +44,20 @@ async function findContainer(userId) {
   return match ? docker.getContainer(match.Id) : null;
 }
 
+// Does a Docker network with this id still exist? Used to detect containers left
+// bound to a network that was recreated with a fresh id (e.g. `docker compose up`
+// tears down and recreates redkit-net). Docker refuses to start such containers
+// with "network ... not found".
+async function networkExists(id) {
+  if (!id) return false;
+  try {
+    await docker.getNetwork(id).inspect();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Read the container's IP on our dedicated network (how the gateway reaches it).
 function readTarget(inspectInfo) {
   const net = (inspectInfo.NetworkSettings.Networks || {})[NETWORK];
@@ -57,6 +71,22 @@ function readTarget(inspectInfo) {
 // Ensure the user's container exists and is running; return its network target { ip }.
 async function ensureRunning(userId) {
   let container = await findContainer(userId);
+
+  // A container created in an earlier run can be bound to a network that no
+  // longer exists (recreated with a new id by `docker compose up`). Starting it
+  // then fails with "network not found" — forever, since we keep reusing it.
+  // Detect a stale/missing network binding and recreate the container fresh.
+  if (container) {
+    const existing = await container.inspect();
+    const bound = (existing.NetworkSettings.Networks || {})[NETWORK];
+    if (!bound || !(await networkExists(bound.NetworkID))) {
+      console.log(
+        `[docker] recreating container for user ${userId}: network binding is stale`
+      );
+      await container.remove({ force: true });
+      container = null;
+    }
+  }
 
   if (!container) {
     container = await docker.createContainer({
