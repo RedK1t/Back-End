@@ -7,6 +7,7 @@
 // only by the authenticated gateway via its internal IP.
 
 const Docker = require("dockerode");
+const net = require("net");
 
 const docker = new Docker(); // talks to /var/run/docker.sock by default
 
@@ -150,6 +151,30 @@ async function remove(userId) {
   return true;
 }
 
+// Is a TCP port on the container actually accepting connections yet? The container
+// "starting" (docker.start resolved) is NOT the same as its services being up — the
+// entrypoint sleeps then boots VNC + supervisord (mitmproxy on PROXY_PORT), which takes
+// ~10-15s. A single quick TCP connect lets the frontend show real connection progress
+// instead of a premature "disconnected" screen. Resolves true on connect, false otherwise.
+function probeReachable(ip, port, timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    if (!ip) return resolve(false);
+    const sock = new net.Socket();
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once("connect", () => finish(true));
+    sock.once("timeout", () => finish(false));
+    sock.once("error", () => finish(false));
+    sock.connect(Number(port), ip);
+  });
+}
+
 // List all RedKit-managed containers (used to reconcile on orchestrator startup).
 async function listManaged() {
   const list = await docker.listContainers({
@@ -172,4 +197,5 @@ module.exports = {
   remove,
   listManaged,
   findContainer,
+  probeReachable,
 };

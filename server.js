@@ -109,12 +109,16 @@ app.post("/session/stop", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/session/status", requireAuth, (req, res) => {
+app.get("/session/status", requireAuth, async (req, res) => {
   const s = sessions.get(req.userId);
   if (s && s.ip) {
-    return res.json({ running: true, ...buildUrls(req.userId) });
+    // "running" = container exists; "ready" = its proxy is actually accepting
+    // connections. The frontend polls this to drive connection-progress UI and only
+    // connects the interceptor WebSocket once ready (avoids a premature failed connect).
+    const ready = await dockerMgr.probeReachable(s.ip, PROXY_PORT, 1000);
+    return res.json({ running: true, ready, ...buildUrls(req.userId) });
   }
-  res.json({ running: false });
+  res.json({ running: false, ready: false });
 });
 
 // ---- data gateway (3009) --------------------------------------------------
