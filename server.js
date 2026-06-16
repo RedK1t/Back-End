@@ -28,6 +28,13 @@ const PUBLIC_HOST = process.env.PUBLIC_HOST || "localhost";
 const VNC_PORT = process.env.VNC_CONTAINER_PORT || "6080";
 const PROXY_PORT = process.env.PROXY_CONTAINER_PORT || "5050";
 
+// Public base URL of the gateway as the browser sees it. Behind a TLS reverse
+// proxy (Caddy) set PUBLIC_BASE_URL=https://gateway.example.com (no port). When
+// unset we fall back to the legacy http://PUBLIC_HOST:GATEWAY_PORT for local dev.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+const HTTP_ORIGIN = PUBLIC_BASE_URL || `http://${PUBLIC_HOST}:${GATEWAY_PORT}`;
+const WS_ORIGIN = HTTP_ORIGIN.replace(/^http/, "ws"); // http->ws, https->wss
+
 // ---- idle / session manager ----------------------------------------------
 // userId -> { ip, lastActivity, timer }
 const sessions = new Map();
@@ -66,8 +73,8 @@ function resetIdle(userId, ip) {
 function buildUrls(userId) {
   const ticket = mintTicket(userId);
   return {
-    vncUrl: `http://${PUBLIC_HOST}:${GATEWAY_PORT}/vnc.html?ticket=${ticket}`,
-    proxyWsUrl: `ws://${PUBLIC_HOST}:${GATEWAY_PORT}/ws?ticket=${ticket}`,
+    vncUrl: `${HTTP_ORIGIN}/vnc.html?ticket=${ticket}`,
+    proxyWsUrl: `${WS_ORIGIN}/ws?ticket=${ticket}`,
   };
 }
 
