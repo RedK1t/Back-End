@@ -69,6 +69,25 @@ function readTarget(inspectInfo) {
   return { ip };
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A just-started container (especially one restarted from a Stopped state) may not
+// have its network IP populated the instant `start()` resolves. Poll inspect a few
+// times until the IP appears so we never throw "IP not available yet" on reconnect.
+async function waitForTarget(container, tries = 15, gapMs = 200) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    const info = await container.inspect();
+    try {
+      return readTarget(info);
+    } catch (err) {
+      lastErr = err;
+      await sleep(gapMs);
+    }
+  }
+  throw lastErr || new Error("container IP on network not available yet");
+}
+
 // Ensure the user's container exists and is running; return its network target { ip }.
 async function ensureRunning(userId) {
   let container = await findContainer(userId);
@@ -109,13 +128,14 @@ async function ensureRunning(userId) {
     });
   }
 
-  let info = await container.inspect();
+  const info = await container.inspect();
   if (!info.State.Running) {
     await container.start();
-    info = await container.inspect();
   }
 
-  return readTarget(info);
+  // Wait until the network IP is actually assigned (a restarted container may not
+  // have it the moment start() resolves) so reconnect never fails with "no IP yet".
+  return waitForTarget(container);
 }
 
 // Read the network target of the user's container if it's running, else null.
@@ -175,6 +195,38 @@ function probeReachable(ip, port, timeoutMs = 1000) {
   });
 }
 
+// Delete managed containers that have been STOPPED longer than maxStoppedMs. Driven
+// purely by Docker's own State.FinishedAt (not the in-memory session map), so it keeps
+// working across orchestrator restarts. Returns the list of removed user ids.
+async function reapStopped(maxStoppedMs) {
+  const removed = [];
+  const list = await docker.listContainers({
+    all: true,
+    filters: { label: [`${MANAGED_LABEL}=true`] },
+  });
+  const now = Date.now();
+  for (const c of list) {
+    if (c.State === "running") continue;
+    const container = docker.getContainer(c.Id);
+    try {
+      const info = await container.inspect();
+      const finishedAt = Date.parse(info.State.FinishedAt || "");
+      // FinishedAt is "0001-01-01T00:00:00Z" (NaN-ish/epoch) for never-started
+      // containers — treat an unparseable/zero value as "old enough to reap".
+      const stoppedFor = Number.isFinite(finishedAt) && finishedAt > 0
+        ? now - finishedAt
+        : Infinity;
+      if (stoppedFor > maxStoppedMs) {
+        await container.remove({ force: true });
+        removed.push(info.Config.Labels[USER_LABEL] || c.Id);
+      }
+    } catch {
+      /* container vanished between list and inspect — nothing to do */
+    }
+  }
+  return removed;
+}
+
 // List all RedKit-managed containers (used to reconcile on orchestrator startup).
 async function listManaged() {
   const list = await docker.listContainers({
@@ -195,6 +247,7 @@ module.exports = {
   getTarget,
   stop,
   remove,
+  reapStopped,
   listManaged,
   findContainer,
   probeReachable,

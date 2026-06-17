@@ -22,11 +22,37 @@ const { mintTicket, verifyTicket, signCookie, verifyCookie } = require("./ticket
 
 const PORT = parseInt(process.env.PORT || "3008", 10);
 const GATEWAY_PORT = parseInt(process.env.GATEWAY_PORT || "3009", 10);
-const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || "300000", 10);
+const IDLE_TIMEOUT_MS = parseInt(process.env.IDLE_TIMEOUT_MS || "600000", 10);
+// Delete a container that has stayed stopped longer than this (default 2h), and how
+// often the background reaper sweeps for them.
+const STOPPED_TTL_MS = parseInt(process.env.STOPPED_TTL_MS || "7200000", 10);
+const REAP_INTERVAL_MS = parseInt(process.env.REAP_INTERVAL_MS || "600000", 10);
+// Cap how long /session/open may wait for a container to come up so the request can
+// never hang forever (the UI would sit on "Requesting session" otherwise).
+const OPEN_TIMEOUT_MS = parseInt(process.env.OPEN_TIMEOUT_MS || "25000", 10);
 const TICKET_TTL_MS = parseInt(process.env.TICKET_TTL_MS || "21600000", 10);
 const PUBLIC_HOST = process.env.PUBLIC_HOST || "localhost";
 const VNC_PORT = process.env.VNC_CONTAINER_PORT || "6080";
 const PROXY_PORT = process.env.PROXY_CONTAINER_PORT || "5050";
+
+// ---- chatbot (Groq) config ------------------------------------------------
+// The key lives here (server-side) so it never ships in the client bundle. The
+// frontend POSTs the conversation to /api/chat; we prepend the system prompt and try
+// each model in order until one answers.
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_SYSTEM_PROMPT = process.env.GROQ_SYSTEM_PROMPT || "";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODELS = [
+  "openai/gpt-oss-120b",
+  "llama-3.3-70b-versatile",
+  "meta-llama/llama-4-maverick-17b-128e-instruct",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "openai/gpt-oss-20b",
+  "moonshotai/kimi-k2-instruct-0905",
+  "groq/compound",
+  "groq/compound-mini",
+  "llama-3.1-8b-instant",
+];
 
 // Public base URL of the gateway as the browser sees it. Behind a TLS reverse
 // proxy (Caddy) set PUBLIC_BASE_URL=https://gateway.example.com (no port). When
@@ -87,12 +113,18 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/session/open", requireAuth, async (req, res) => {
   try {
-    const { ip } = await dockerMgr.ensureRunning(req.userId);
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("ensureRunning timed out")), OPEN_TIMEOUT_MS)
+    );
+    const { ip } = await Promise.race([dockerMgr.ensureRunning(req.userId), timeout]);
     resetIdle(req.userId, ip);
     res.json({ userId: req.userId, ...buildUrls(req.userId) });
   } catch (err) {
     console.error("[open] failed:", err.message);
-    res.status(500).json({ error: "failed_to_open_session", detail: err.message });
+    const timedOut = err.message === "ensureRunning timed out";
+    res
+      .status(timedOut ? 504 : 500)
+      .json({ error: "failed_to_open_session", detail: err.message });
   }
 });
 
@@ -126,6 +158,70 @@ app.get("/session/status", requireAuth, async (req, res) => {
     return res.json({ running: true, ready, ...buildUrls(req.userId) });
   }
   res.json({ running: false, ready: false });
+});
+
+// ---- Groq proxy (3008) ----------------------------------------------------
+// The Groq key lives here so it never ships in the client bundle. Both routes are
+// authenticated (no anonymous key abuse) and fall back across models so a single
+// decommissioned model doesn't break the feature. Returns the assistant message.
+async function callGroq(messages, { responseFormat } = {}) {
+  for (const model of GROQ_MODELS) {
+    try {
+      const body = { model, messages, temperature: 0.3 };
+      if (responseFormat) body.response_format = responseFormat;
+      const r = await fetch(GROQ_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        console.error(`[groq] model ${model} -> ${r.status}`);
+        continue; // try the next model
+      }
+      const data = await r.json();
+      const message = data && data.choices && data.choices[0] && data.choices[0].message;
+      if (message && typeof message.content === "string" && message.content) {
+        return { role: "assistant", content: message.content };
+      }
+    } catch (err) {
+      console.error(`[groq] model ${model} failed:`, err.message);
+    }
+  }
+  return null;
+}
+
+function readMessages(req) {
+  const incoming = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+  return incoming
+    .filter((m) => m && m.role && typeof m.content === "string")
+    .map((m) => ({ role: m.role, content: m.content }));
+}
+
+// Chatbot assistant: server owns the system prompt; client sends only the conversation
+// (any client-sent system message is dropped to prevent prompt-role injection).
+app.post("/api/chat", requireAuth, async (req, res) => {
+  if (!GROQ_API_KEY) return res.status(503).json({ error: "chat_unconfigured" });
+  const convo = readMessages(req).filter((m) => m.role !== "system");
+  if (!convo.length) return res.status(400).json({ error: "no_messages" });
+  const messages = GROQ_SYSTEM_PROMPT
+    ? [{ role: "system", content: GROQ_SYSTEM_PROMPT }, ...convo]
+    : convo;
+  const out = await callGroq(messages);
+  return out ? res.json(out) : res.status(502).json({ error: "chat_upstream_failed" });
+});
+
+// Generic Groq pass-through (e.g. Reconnaissance company-info). The caller supplies its
+// own messages (incl. system) and optional response_format; the key stays server-side.
+app.post("/api/groq", requireAuth, async (req, res) => {
+  if (!GROQ_API_KEY) return res.status(503).json({ error: "groq_unconfigured" });
+  const messages = readMessages(req);
+  if (!messages.length) return res.status(400).json({ error: "no_messages" });
+  const responseFormat = req.body && req.body.response_format;
+  const out = await callGroq(messages, { responseFormat });
+  return out ? res.json(out) : res.status(502).json({ error: "groq_upstream_failed" });
 });
 
 // ---- data gateway (3009) --------------------------------------------------
@@ -263,6 +359,21 @@ async function start() {
   });
 
   await reconcile();
+
+  // Background reaper: delete containers stopped longer than STOPPED_TTL_MS so dead
+  // sessions don't accumulate. Idle-stop (resetIdle) handles stopping; this handles
+  // the final cleanup, independent of the in-memory session map.
+  const reaper = setInterval(async () => {
+    try {
+      const removed = await dockerMgr.reapStopped(STOPPED_TTL_MS);
+      if (removed.length) {
+        console.log(`[reap] removed ${removed.length} stale container(s): ${removed.join(", ")}`);
+      }
+    } catch (err) {
+      console.error("[reap] failed:", err.message);
+    }
+  }, REAP_INTERVAL_MS);
+  if (typeof reaper.unref === "function") reaper.unref();
 }
 
 start();
